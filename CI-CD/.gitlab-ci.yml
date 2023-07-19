@@ -1,0 +1,103 @@
+stages:
+  - install
+  - build
+  - sast
+  - dast
+  - api
+  - reload
+
+install_dependencies:
+  image: golang:1.18
+  stage: install
+  only:
+    refs:
+      - dev
+    changes:
+      - go.mod
+  script:
+    - go mod download
+  cache:
+    key: ${CI_PROJECT_ID}
+    paths:
+      - /go/pkg/mod
+
+sonarqube_check_dev:
+  stage: sast
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "dev"'
+
+build_and_push_dev:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  only:
+    refs:
+      - dev
+  script:
+    - mkdir -p /kaniko/.docker
+    - echo "{\"auths\":{\"${CI_REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')\"}}}" > /kaniko/.docker/config.json
+    - >-
+      /kaniko/executor
+      --context "${CI_PROJECT_DIR}"
+      --dockerfile "${CI_PROJECT_DIR}/Dockerfile"
+      --destination "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      --destination "${CI_REGISTRY_IMAGE}:latest"
+  cache:
+    key: ${CI_PROJECT_ID}
+    paths:
+      - /go/pkg/mod
+
+api_automation_test:
+  stage: api
+  image: node:16
+  only:
+    - dev
+  needs:
+    - build_and_push_dev
+  script:
+    - node automationtest.js
+  artifacts:
+    when: always
+    paths:
+      - report.html
+
+deploy_dev:
+  image: argocd-cli:latest
+  stage: reload
+  only:
+    - dev
+  needs:
+    - api_automation_test
+  variables:
+    ARGOCD_SERVER: 'argocd-server.argocd:443'
+  script:
+    - argocd app actions run backend restart --kind Deployment
+
+dast:
+  stage: dast
+  needs:
+    - deploy_dev
+  image:
+    name: zap2docker-weekly:latest
+  before_script:
+    - mkdir -p /zap/wrk
+  script:
+    - zap-full-scan.py -t "https://testphp.vulnweb.com" -I -r testreport.html --hook=/zap/auth_hook.py -z "auth.loginurl=http://example.com/login.php auth.username_field="uname" auth.password_field="pass" auth.username="$DAST_USERNAME" auth.password="$DAST_PASSWORD""
+    - cp /zap/wrk/testreport.html testreport.html
+  artifacts:
+    when: always
+    paths:
+      - testreport.html
